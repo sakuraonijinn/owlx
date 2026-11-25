@@ -1,0 +1,29 @@
+app "owlx" {
+  state base = "http://127.0.0.1:8787"
+  state token = ""
+  state status = "idle"
+  state hooks = ""
+
+  fn refresh() {
+    if token == "" { status = "set token"; hooks = ""; return }
+    r = shell("curl -fsS -H 'Authorization: Bearer " + token + "' " + base + "/api/hooks", 5000)
+    if r.ok { status = "ok"; hooks = r.out } else { status = "error"; hooks = r.err }
+  }
+
+  onMount { refresh() }
+
+  column pad=12 gap=8 {
+    text "owlx" size=20 bold=true
+    text "phone control dash" size=12 muted=true
+    row gap=8 {
+      input base placeholder="base url" grow=1
+      button "Refresh" { refresh() }
+    }
+    input token placeholder="OWLX_TOKEN" secret=true
+    text "status: " + status size=12 muted=true
+    text "hooks" size=14 bold=true
+    box pad=8 radius=8 bg=#111 {
+      text hooks size=11 mono=true
+    }
+  }
+}
