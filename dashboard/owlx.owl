@@ -1,29 +1,157 @@
 app "owlx" {
-  state base = "http://127.0.0.1:8787"
-  state token = ""
-  state status = "idle"
-  state hooks = ""
+  meta { description: "Control Frida hooks and mitmproxy on your own test devices"; category: "dev"; owl: 12 }
+  title: "owlx"
 
-  fn refresh() {
-    if token == "" { status = "set token"; hooks = ""; return }
-    r = shell("curl -fsS -H 'Authorization: Bearer " + token + "' " + base + "/api/hooks", 5000)
-    if r.ok { status = "ok"; hooks = r.out } else { status = "error"; hooks = r.err }
+  // This is a LAN service over http, so a secret state cannot be used here.
+  // Keep the token long, random, and only on your own network.
+  state base = "http://127.0.0.1:8787" persist
+  state token = "" persist
+  state script = "default.js" persist
+  state proxyHost = "127.0.0.1" persist
+  state proxyPort = "8080" persist
+  state result = null
+  state problem = ""
+
+  source status = http(token == "" ? null : base + "/api/status", {Authorization: "Bearer " + token}) every 5s json status
+  source hooks = http(token == "" ? null : base + "/api/hooks", {Authorization: "Bearer " + token}) every 5s json status
+  source procs = http(token == "" ? null : base + "/api/processes", {Authorization: "Bearer " + token}) every 10s json status
+  source scripts = http(token == "" ? null : base + "/api/scripts", {Authorization: "Bearer " + token}) every 15s json status
+  source events = http(token == "" ? null : base + "/api/events", {Authorization: "Bearer " + token}) every 5s json status
+
+  on result {
+    problem = value.ok ? "" : "error ${value.code}: ${value.out}"
   }
 
-  onMount { refresh() }
+  let headers = {Authorization: "Bearer " + token}
+  let attached = (hooks.out ?? {}).hooks ?? []
+  let processes = take((procs.out ?? {}).processes ?? [], 24)
+  let scriptNames = map((scripts.out ?? {}).scripts ?? [], s => s.name)
+  let recent = reverse((events.out ?? {}).events ?? [])
+  let mitm = (status.out ?? {}).mitm ?? {}
+  let frida = (status.out ?? {}).frida ?? {}
+  let proxyMode = ((status.out ?? {}).proxy ?? {}).mode ?? "none"
 
-  column pad=12 gap=8 {
-    text "owlx" size=20 bold=true
-    text "phone control dash" size=12 muted=true
-    row gap=8 {
-      input base placeholder="base url" grow=1
-      button "Refresh" { refresh() }
+  Column {
+    fill: true
+    padding: 12
+    gap: 9
+
+    Row {
+      gap: 8
+      align: center
+      Text { text: "owlx"; style: title; bold: true; weight: 1 }
+      Text { text: frida.connected == true ? "frida online" : "frida offline"; style: small; color: frida.connected == true ? accent : muted }
     }
-    input token placeholder="OWLX_TOKEN" secret=true
-    text "status: " + status size=12 muted=true
-    text "hooks" size=14 bold=true
-    box pad=8 radius=8 bg=#111 {
-      text hooks size=11 mono=true
+
+    Column {
+      gap: 5
+      Input { text: base; placeholder: "phone service URL"; onChange: base = value }
+      Row {
+        gap: 6
+        align: center
+        Input { text: token; placeholder: "OWLX_TOKEN"; password: true; weight: 1; onChange: token = value }
+      }
+    }
+
+    if token == "" {
+      Text { text: "Enter the token from the phone service, then the dashboard fills in."; style: muted }
+    } else {
+      Text {
+        text: "hooks ${len(attached)} · mitm ${mitm.running == true ? "running" : "stopped"} · proxy ${proxyMode}"
+        style: small
+        color: muted
+      }
+      if problem != "" { Text { text: problem; style: small; color: red } }
+
+      Text { text: "attached hooks"; bold: true }
+      Box {
+        padding: 8
+        radius: 8
+        background: alpha(background, 0.5)
+        Column {
+          gap: 4
+          if len(attached) == 0 { Text { text: "none"; style: muted } }
+          for h in attached {
+            Row {
+              gap: 8
+              align: center
+              Text { text: "#${h.pid}"; font: mono; weight: 1 }
+              Text { text: h.script; style: small; color: muted; weight: 1 }
+              Text {
+                text: "detach"
+                style: small
+                color: red
+                onTap: result = post(base + "/api/hooks/${enc(h.pid)}", null, headers, method: "DELETE")
+              }
+            }
+          }
+        }
+      }
+
+      Text { text: "processes"; bold: true }
+      Row {
+        gap: 6
+        align: center
+        Input { text: script; placeholder: "hook script"; weight: 1; onChange: script = value }
+      }
+      Column {
+        weight: 1
+        scroll: true
+        gap: 2
+        if len(processes) == 0 { Text { text: "no processes"; style: muted } }
+        for p in processes {
+          Row {
+            gap: 8
+            align: center
+            Text { text: "${p.pid}"; font: mono; width: 54; style: small }
+            Text { text: p.name; weight: 1; maxLines: 1 }
+            Text {
+              text: "hook"
+              style: small
+              color: accent
+              onTap: result = post(base + "/api/hooks", {pid: p.pid, script: script}, headers)
+            }
+          }
+        }
+      }
+
+      Row {
+        gap: 6
+        Button {
+          text: "mitm on"
+          onTap: result = post(base + "/api/mitm", {action: "start", port: int(proxyPort)}, headers)
+        }
+        Button {
+          text: "mitm off"
+          onTap: result = post(base + "/api/mitm", {action: "stop"}, headers)
+        }
+      }
+      Row {
+        gap: 6
+        align: center
+        Input { text: proxyHost; placeholder: "proxy host"; weight: 1; onChange: proxyHost = value }
+        Input { text: proxyPort; placeholder: "port"; width: 70; onChange: proxyPort = value }
+        Text {
+          text: "set"
+          color: accent
+          onTap: result = post(base + "/api/proxy", {action: "set", host: proxyHost, port: int(proxyPort)}, headers)
+        }
+        Text {
+          text: "clear"
+          color: muted
+          onTap: result = post(base + "/api/proxy", {action: "clear"}, headers)
+        }
+      }
+
+      Text { text: "recent events"; bold: true }
+      Column {
+        scroll: true
+        gap: 2
+        if len(recent) == 0 { Text { text: "nothing yet"; style: muted } }
+        for e in take(recent, 30) {
+          Text { text: "${e.type}"; font: mono; style: small; maxLines: 1 }
+        }
+      }
     }
   }
 }
