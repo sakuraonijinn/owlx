@@ -24,7 +24,8 @@ try:
 except Exception:  # service still runs so the dashboard can report the problem
     frida = None
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+EXPECTED_FRIDA_VERSION = "17.27.5"
 STATE_KEY = web.AppKey("state", object)
 TOKEN_KEY = web.AppKey("token", str)
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,75 @@ def hook_path(hooks_dir, name):
     return path
 
 
+def bindings_version():
+    return getattr(frida, "__version__", "unknown") if frida is not None else "not installed"
+
+
+def remote_target(spec):
+    """Return (host, port) for a remote frida spec, None for local/usb."""
+    if spec.startswith("remote:"):
+        spec = spec[len("remote:"):]
+    if spec in ("local", "usb"):
+        return None
+    host, sep, port = spec.rpartition(":")
+    if not sep or not host or not port.isdigit() or not 0 < int(port) <= 65535:
+        raise ValueError(f"invalid remote device {spec!r}; expected remote:host:port")
+    return host, int(port)
+
+
+async def check_tcp(host, port, timeout):
+    """Bounded reachability probe for frida-server's TCP listener."""
+    try:
+        _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True, ""
+    except asyncio.TimeoutError:
+        return False, f"timed out after {timeout:g}s"
+    except OSError as exc:
+        return False, f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
+    except Exception as exc:
+        return False, str(exc) or exc.__class__.__name__
+
+
+def diagnose_frida_error(spec, error, timeout=10.0):
+    """Turn a low-level Frida failure into an actionable message."""
+    text = str(error).strip() if error else ""
+    low = text.lower()
+    try:
+        target_parts = remote_target(spec)
+    except ValueError:
+        target_parts = None
+    target = f"{target_parts[0]}:{target_parts[1]}" if target_parts else str(spec)
+    installed = bindings_version()
+
+    if frida is None:
+        return ("frida Python bindings are not installed; install the matching frida package "
+                f"({EXPECTED_FRIDA_VERSION} on this setup) before starting the engine")
+    if isinstance(error, asyncio.TimeoutError) or "timed out" in low or "timeout" in low:
+        return (f"timed out contacting frida-server at {target} after {timeout:g}s; "
+                "check TABLET_IP, Wi-Fi and firewall, and confirm the Magisk module started "
+                f"frida-server {EXPECTED_FRIDA_VERSION} on 0.0.0.0:27042")
+    if any(k in low for k in ("version", "mismatch", "incompatible", "protocol", "handshake")):
+        return (f"frida protocol/version mismatch with {target}: {text or error.__class__.__name__}. "
+                f"Python bindings are {installed}; the tablet must run the same version "
+                f"({EXPECTED_FRIDA_VERSION}). Reflash with tablet/fetch-frida-server.sh "
+                "and tablet/build-module.sh")
+    if any(k in low for k in ("refused", "no route", "unreachable", "host is down",
+                              "network is down", "ehostunreach", "enohostroute")):
+        return (f"cannot reach frida-server at {target}: {text or error.__class__.__name__}. "
+                "Is the tablet online, is TABLET_IP correct, and is the Magisk module running? "
+                f"Verify with `frida-ps -H {target}`")
+    if "invalid remote device" in low:
+        return text
+    return (f"frida connection to {target} failed: {text or error.__class__.__name__}. "
+            f"Expected frida-server {EXPECTED_FRIDA_VERSION} listening on 0.0.0.0:27042; "
+            f"bindings here are {installed}.")
+
+
 def get_device(spec):
     if frida is None:
         raise RuntimeError("frida Python bindings are not installed")
@@ -54,11 +124,16 @@ def get_device(spec):
 
 
 class State:
-    def __init__(self, device_spec, hooks_dir):
+    def __init__(self, device_spec, hooks_dir, frida_timeout=10.0):
         self.device_spec = device_spec
+        self.frida_timeout = float(frida_timeout)
         self.hooks_dir = Path(hooks_dir)
         self.device = None
         self.device_error = ""
+        self.device_diagnostic = ""
+        self.device_message = f"frida connecting to {device_spec}"
+        self.device_checked_at = None
+        self.device_process_count = 0
         self.loop = None
         self.clients = set()
         self.events = deque(maxlen=EVENT_LIMIT)
@@ -119,10 +194,22 @@ async def healthz(_request):
 
 async def status(request):
     state = request.app[STATE_KEY]
+    connected = state.device is not None
     return web.json_response({
         "version": VERSION,
-        "frida": {"available": frida is not None, "device": state.device_spec,
-                  "connected": state.device is not None, "error": state.device_error},
+        "frida": {
+            "available": frida is not None,
+            "device": state.device_spec,
+            "connected": connected,
+            "state": "connected" if connected else "error",
+            "message": state.device_message,
+            "error": state.device_error,
+            "diagnostic": state.device_diagnostic,
+            "checked_at": state.device_checked_at,
+            "process_count": state.device_process_count,
+            "bindings_version": bindings_version(),
+            "expected_version": EXPECTED_FRIDA_VERSION,
+        },
         "hooks": [hook_info(h) for h in sorted(state.sessions.values(), key=lambda h: h["pid"])],
         "mitm": {"running": state.mitm_proc is not None and state.mitm_proc.returncode is None,
                  "options": state.mitm_options, "log_lines": len(state.mitm_log)},
@@ -134,7 +221,8 @@ async def status(request):
 async def processes(request):
     state = request.app[STATE_KEY]
     if state.device is None:
-        return web.json_response({"error": state.device_error or "no frida device"}, status=503)
+        return web.json_response({"error": state.device_diagnostic or state.device_error
+                                  or "no frida device"}, status=503)
     needle = request.query.get("filter", "").lower()
     try:
         found = await asyncio.to_thread(state.device.enumerate_processes)
@@ -172,7 +260,7 @@ async def scripts_save(request):
 
 def do_attach(state, pid, name):
     if state.device is None:
-        raise RuntimeError(state.device_error or "no frida device")
+        raise RuntimeError(state.device_diagnostic or state.device_error or "no frida device")
     path = hook_path(state.hooks_dir, name)
     source = path.read_text(encoding="utf-8")
     with state.lock:
@@ -241,11 +329,47 @@ async def hooks_list(request):
 
 async def read_mitm(state, proc):
     assert proc.stdout is not None
-    async for line in proc.stdout:
-        text = line.decode("utf-8", "replace").rstrip()
-        if text:
-            state.mitm_log.append(text)
-    await proc.wait()
+    try:
+        async for line in proc.stdout:
+            text = line.decode("utf-8", "replace").rstrip()
+            if text:
+                state.mitm_log.append(text)
+        await proc.wait()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        state.mitm_log.append(f"mitmproxy log reader failed: {exc}")
+
+
+async def stop_mitm(state):
+    """Terminate mitmproxy and drain its log reader; safe to call on cleanup."""
+    proc = state.mitm_proc
+    task = state.mitm_task
+    stopped = proc is not None
+    if proc is not None:
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), 5)
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    pass
+            except ProcessLookupError:
+                pass
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    state.mitm_proc = None
+    state.mitm_task = None
+    state.mitm_options = {}
+    return stopped
 
 
 async def mitm_control(request):
@@ -256,14 +380,19 @@ async def mitm_control(request):
     if action == "start":
         if running:
             return web.json_response({"error": "mitmproxy already running"}, status=409)
-        port = int(body.get("port", 8080))
+        try:
+            port = int(body.get("port", 8080))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "port must be an integer"}, status=400)
+        if not 0 < port <= 65535:
+            return web.json_response({"error": "port out of range"}, status=400)
         out = body.get("out") or str(ROOT / "flows.mitm")
         cmd = ["mitmproxy", "-l", str(port), "-w", out]
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         except Exception as exc:
-            return web.json_response({"error": str(exc)}, status=502)
+            return web.json_response({"error": f"could not start mitmproxy: {exc}"}, status=502)
         state.mitm_proc = proc
         state.mitm_options = {"port": port, "out": out, "pid": proc.pid}
         state.mitm_log.clear()
@@ -272,12 +401,10 @@ async def mitm_control(request):
         return web.json_response({"running": True, "options": state.mitm_options})
     if action == "stop":
         if not running:
+            if state.mitm_proc is not None:
+                await stop_mitm(state)  # clear a child that exited on its own
             return web.json_response({"error": "mitmproxy not running"}, status=409)
-        state.mitm_proc.terminate()
-        try:
-            await asyncio.wait_for(state.mitm_proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
-            state.mitm_proc.kill()
+        await stop_mitm(state)
         await emit(state, "mitm.stopped")
         return web.json_response({"running": False})
     return web.json_response({"running": running, "options": state.mitm_options})
@@ -302,9 +429,14 @@ async def proxy_control(request):
         value = ":0"
     elif action == "set":
         host = body.get("host", "")
-        port = int(body.get("port", 8080))
+        try:
+            port = int(body.get("port", 8080))
+        except (TypeError, ValueError):
+            return web.json_response({"error": "port must be an integer"}, status=400)
         if not host:
             return web.json_response({"error": "host required"}, status=400)
+        if not 0 < port <= 65535:
+            return web.json_response({"error": "port out of range"}, status=400)
         value = f"{host}:{port}"
     else:
         return web.json_response({"error": "action must be set or clear"}, status=400)
@@ -319,7 +451,7 @@ async def proxy_control(request):
     except Exception as exc:
         return web.json_response({"error": str(exc), "command": " ".join(cmd)}, status=502)
     state.proxy = {"mode": action, "host": body.get("host", ""),
-                   "port": int(body.get("port", 0)) if action == "set" else 0,
+                   "port": port if action == "set" else 0,
                    "device": device, "value": value}
     await emit(state, "proxy.changed", action=action, value=value)
     return web.json_response({"proxy": state.proxy, "command": " ".join(cmd),
@@ -353,16 +485,44 @@ async def websocket(request):
     return ws
 
 
+async def connect_device(state):
+    """Probe and attach the configured frida device, recording a clear failure."""
+    spec = state.device_spec
+    timeout = state.frida_timeout
+    state.device = None
+    state.device_error = ""
+    state.device_diagnostic = ""
+    state.device_message = f"frida connecting to {spec}"
+    state.device_checked_at = time.time()
+    state.device_process_count = 0
+    try:
+        if spec not in ("local", "usb"):
+            host, port = remote_target(spec)
+            ok, detail = await check_tcp(host, port, timeout)
+            if not ok:
+                raise RuntimeError(f"cannot reach {host}:{port}: {detail}")
+        device = await asyncio.wait_for(asyncio.to_thread(get_device, spec), timeout)
+        processes = await asyncio.wait_for(asyncio.to_thread(device.enumerate_processes), timeout)
+        state.device = device
+        state.device_process_count = len(processes)
+        state.device_message = f"frida connected to {spec} ({len(processes)} processes)"
+        await emit(state, "device.connected", spec=spec, processes=len(processes),
+                   message=state.device_message)
+        return device
+    except Exception as exc:
+        state.device_error = str(exc) or exc.__class__.__name__
+        state.device_diagnostic = diagnose_frida_error(spec, exc, timeout)
+        state.device_message = state.device_diagnostic
+        await emit(state, "device.error", spec=spec, error=state.device_error,
+                   diagnostic=state.device_diagnostic)
+        return None
+
+
 async def on_startup(app):
     state = app[STATE_KEY]
     state.loop = asyncio.get_running_loop()
     state.hooks_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        state.device = await asyncio.to_thread(get_device, state.device_spec)
-        await emit(state, "device.connected", spec=state.device_spec)
-    except Exception as exc:
-        state.device_error = str(exc)
-        await emit(state, "device.error", error=state.device_error)
+    await connect_device(state)
 
 
 async def on_cleanup(app):
@@ -372,8 +532,7 @@ async def on_cleanup(app):
             await asyncio.to_thread(do_detach, state, pid)
         except Exception:
             pass
-    if state.mitm_proc is not None and state.mitm_proc.returncode is None:
-        state.mitm_proc.terminate()
+    await stop_mitm(state)
 
 
 def make_app(state, token):
@@ -406,12 +565,15 @@ def main():
     ap.add_argument("--port", type=int, default=8787)
     ap.add_argument("--device", default=os.environ.get("OWLX_DEVICE", "remote:127.0.0.1:27042"),
                     help="local, usb, remote:host:port or host:port (frida-server)")
+    ap.add_argument("--frida-timeout", type=float,
+                    default=float(os.environ.get("OWLX_FRIDA_TIMEOUT", "10")),
+                    help="seconds allowed for the frida-server probe (default: 10)")
     ap.add_argument("--hooks-dir", default=os.environ.get("OWLX_HOOKS_DIR", str(ROOT / "hooks")))
     args = ap.parse_args()
     token = os.environ.get("OWLX_TOKEN", "")
     if not token:
         raise SystemExit("OWLX_TOKEN is required")
-    state = State(args.device, args.hooks_dir)
+    state = State(args.device, args.hooks_dir, args.frida_timeout)
     web.run_app(make_app(state, token), host=args.host, port=args.port, print=None)
 
 

@@ -1,0 +1,36 @@
+# systemd *user* unit for the NixOS laptop. Copy to
+# ~/.config/systemd/user/owlx-engine.service, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now owlx-engine
+# The token stays in ~/.config/owlx/token (chmod 600), never in this file or git.
+# TABLET_IP and friends can be overridden in ~/.config/owlx/engine.env.
+[Unit]
+Description=owlx engine (Frida + mitmproxy control service)
+# network-online.target is a *system* unit and is not available in a user
+# manager. The launcher probes the tablet with a bounded timeout instead and
+# publishes a clear diagnostic via `start-engine.sh status`.
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+UMask=0077
+Environment=OWLX_ROOT=%h/owlx
+Environment=TABLET_IP=10.10.10.119
+Environment=FRIDA_PORT=27042
+Environment=OWLX_HOST=0.0.0.0
+Environment=OWLX_PORT=8787
+Environment=OWLX_MITM=1
+Environment=OWLX_MITM_PORT=8080
+Environment=OWLX_FRIDA_TIMEOUT=10
+Environment=OWLX_HEALTH_TIMEOUT=30
+Environment=OWLX_TOKEN_FILE=%h/.config/owlx/token
+EnvironmentFile=-%h/.config/owlx/engine.env
+ExecStart=/bin/sh -c 'exec "$OWLX_ROOT/nixos/start-engine.sh" foreground'
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=2
+TimeoutStopSec=20s
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

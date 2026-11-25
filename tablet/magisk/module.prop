@@ -1,0 +1,6 @@
+id=owlx_frida
+name=owlx frida-server
+version=17.27.5
+versionCode=172705
+author=sakuraonijinn
+description=Starts frida-server 17.27.5 at boot on 0.0.0.0:27042 for the laptop-hosted owlx engine.

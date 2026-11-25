@@ -2,21 +2,25 @@ app "owlx" {
   meta { description: "Control Frida hooks and mitmproxy on your own test devices"; category: "dev"; owl: 12 }
   title: "owlx"
 
-  // This is a LAN service over http, so a secret state cannot be used here.
-  // Keep the token long, random, and only on your own network.
-  state base = "http://127.0.0.1:8787" persist
+  // EDIT THIS LINE: the NixOS laptop running nixos/start-engine.sh.
+  // OWL requires the scheme and host to be fixed text, so it lives in a let,
+  // not a state or an input. The rest of the URL is fixed paths only.
+  let api = "http://LAPTOP_IP:8787"
+
+  // This is a LAN service over plain http, so a secret state cannot be used
+  // here. Keep the token long, random, and only on your own network.
   state token = "" persist
   state script = "default.js" persist
-  state proxyHost = "127.0.0.1" persist
+  state proxyHost = "10.10.10.119" persist
   state proxyPort = "8080" persist
   state result = null
   state problem = ""
 
-  source status = http(token == "" ? null : base + "/api/status", {Authorization: "Bearer " + token}) every 5s json status
-  source hooks = http(token == "" ? null : base + "/api/hooks", {Authorization: "Bearer " + token}) every 5s json status
-  source procs = http(token == "" ? null : base + "/api/processes", {Authorization: "Bearer " + token}) every 10s json status
-  source scripts = http(token == "" ? null : base + "/api/scripts", {Authorization: "Bearer " + token}) every 15s json status
-  source events = http(token == "" ? null : base + "/api/events", {Authorization: "Bearer " + token}) every 5s json status
+  source status = http(token == "" ? null : api + "/api/status", {Authorization: "Bearer " + token}) every 5s json status
+  source hooks = http(token == "" ? null : api + "/api/hooks", {Authorization: "Bearer " + token}) every 5s json status
+  source procs = http(token == "" ? null : api + "/api/processes", {Authorization: "Bearer " + token}) every 10s json status
+  source scripts = http(token == "" ? null : api + "/api/scripts", {Authorization: "Bearer " + token}) every 15s json status
+  source events = http(token == "" ? null : api + "/api/events", {Authorization: "Bearer " + token}) every 5s json status
 
   on result {
     problem = value.ok ? "" : "error ${value.code}: ${value.out}"
@@ -25,7 +29,6 @@ app "owlx" {
   let headers = {Authorization: "Bearer " + token}
   let attached = (hooks.out ?? {}).hooks ?? []
   let processes = take((procs.out ?? {}).processes ?? [], 24)
-  let scriptNames = map((scripts.out ?? {}).scripts ?? [], s => s.name)
   let recent = reverse((events.out ?? {}).events ?? [])
   let mitm = (status.out ?? {}).mitm ?? {}
   let frida = (status.out ?? {}).frida ?? {}
@@ -42,19 +45,16 @@ app "owlx" {
       Text { text: "owlx"; style: title; bold: true; weight: 1 }
       Text { text: frida.connected == true ? "frida online" : "frida offline"; style: small; color: frida.connected == true ? accent : muted }
     }
+    Text { text: api; style: small; color: muted; maxLines: 1 }
 
-    Column {
-      gap: 5
-      Input { text: base; placeholder: "phone service URL"; onChange: base = value }
-      Row {
-        gap: 6
-        align: center
-        Input { text: token; placeholder: "OWLX_TOKEN"; password: true; weight: 1; onChange: token = value }
-      }
+    Row {
+      gap: 6
+      align: center
+      Input { text: token; placeholder: "token from the laptop"; password: true; weight: 1; onChange: token = value }
     }
 
     if token == "" {
-      Text { text: "Enter the token from the phone service, then the dashboard fills in."; style: muted }
+      Text { text: "Enter the token from ~/.config/owlx/token on the laptop."; style: muted }
     } else {
       Text {
         text: "hooks ${len(attached)} · mitm ${mitm.running == true ? "running" : "stopped"} · proxy ${proxyMode}"
@@ -81,7 +81,7 @@ app "owlx" {
                 text: "detach"
                 style: small
                 color: red
-                onTap: result = post(base + "/api/hooks/${enc(h.pid)}", null, headers, method: "DELETE")
+                onTap: result = post(api + "/api/hooks/${enc(h.pid)}", null, headers, method: "DELETE")
               }
             }
           }
@@ -109,7 +109,7 @@ app "owlx" {
               text: "hook"
               style: small
               color: accent
-              onTap: result = post(base + "/api/hooks", {pid: p.pid, script: script}, headers)
+              onTap: result = post(api + "/api/hooks", {pid: p.pid, script: script}, headers)
             }
           }
         }
@@ -119,11 +119,11 @@ app "owlx" {
         gap: 6
         Button {
           text: "mitm on"
-          onTap: result = post(base + "/api/mitm", {action: "start", port: int(proxyPort)}, headers)
+          onTap: result = post(api + "/api/mitm", {action: "start", port: int(proxyPort)}, headers)
         }
         Button {
           text: "mitm off"
-          onTap: result = post(base + "/api/mitm", {action: "stop"}, headers)
+          onTap: result = post(api + "/api/mitm", {action: "stop"}, headers)
         }
       }
       Row {
@@ -134,12 +134,12 @@ app "owlx" {
         Text {
           text: "set"
           color: accent
-          onTap: result = post(base + "/api/proxy", {action: "set", host: proxyHost, port: int(proxyPort)}, headers)
+          onTap: result = post(api + "/api/proxy", {action: "set", host: proxyHost, port: int(proxyPort)}, headers)
         }
         Text {
           text: "clear"
           color: muted
-          onTap: result = post(base + "/api/proxy", {action: "clear"}, headers)
+          onTap: result = post(api + "/api/proxy", {action: "clear"}, headers)
         }
       }
 

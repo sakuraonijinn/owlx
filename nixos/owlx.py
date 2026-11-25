@@ -8,6 +8,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 try:
     import websockets
@@ -35,6 +36,19 @@ def show(value):
     print(json.dumps(value, indent=2))
 
 
+def load_token(args):
+    """Prefer an explicit token, then the environment, then the token file."""
+    token = args.token or os.environ.get("OWLX_TOKEN")
+    if not token and args.token_file:
+        try:
+            token = Path(os.path.expanduser(args.token_file)).read_text(encoding="utf-8").strip()
+        except OSError:
+            token = ""
+    if not token:
+        raise SystemExit("OWLX_TOKEN, --token or --token-file with a token is required")
+    return token
+
+
 async def follow(base, token):
     if websockets is None:
         raise SystemExit("event streaming needs websockets: pip install websockets")
@@ -47,7 +61,10 @@ async def follow(base, token):
 def build_parser():
     ap = argparse.ArgumentParser(prog="owlx")
     ap.add_argument("--url", default=os.environ.get("OWLX_URL", "http://127.0.0.1:8787"))
-    ap.add_argument("--token", default=os.environ.get("OWLX_TOKEN"))
+    ap.add_argument("--token", default=os.environ.get("OWLX_TOKEN"),
+                    help="token itself; prefer OWLX_TOKEN or --token-file")
+    ap.add_argument("--token-file", default=os.environ.get("OWLX_TOKEN_FILE", "~/.config/owlx/token"),
+                    help="read the token from this file (default: ~/.config/owlx/token)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="frida, hooks, mitm and proxy status")
@@ -101,13 +118,13 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
-    token = args.token
-    if not token:
-        raise SystemExit("OWLX_TOKEN or --token required")
+    token = load_token(args)
     base = args.url.rstrip("/")
 
     if args.cmd == "status":
-        show(req(base, token, "/api/status"))
+        result = req(base, token, "/api/status")
+        show(result)
+        print("frida: " + str(result.get("frida", {}).get("message", "unknown")), file=sys.stderr)
     elif args.cmd == "processes":
         show(req(base, token, "/api/processes", params={"filter": args.filter}))
     elif args.cmd == "scripts":

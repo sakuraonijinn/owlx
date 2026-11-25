@@ -6,3 +6,6 @@ owlx.token
 flows.mitm
 *.mitm
 *.log
+flows.mitm
+*.mitm
+*.log
